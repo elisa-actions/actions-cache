@@ -3,6 +3,7 @@ import * as utils from "@actions/cache/lib/internal/cacheUtils";
 import { extractTar, listTar } from "@actions/cache/lib/internal/tar";
 import * as core from "@actions/core";
 import * as path from "path";
+import { spawn } from "child_process";
 import { State } from "./state";
 import {
   findObject,
@@ -20,6 +21,47 @@ import {
 } from "./utils";
 
 process.on("uncaughtException", (e) => core.info("warning: " + e.message));
+
+// Fast extract: bypass upstream extractTar() which uses GNU tar without
+// flags that reduce per-file syscall overhead. The Go build cache contains
+// hundreds of thousands of small files, making metadata syscalls
+// (utimensat/chown/chmod) dominant on slow filesystems.
+//
+// Flags vs upstream:
+//   --touch                  skip per-file utimensat()
+//   --no-same-owner          skip per-file chown()
+//   --no-same-permissions    skip per-file chmod() (use umask)
+//
+// Safe for Go build cache: Go uses content-hash filenames, not mtime, for
+// cache lookup. golangci-lint cache likewise keys on content. Module cache
+// (~/go/pkg/mod) uses content-addressed paths.
+async function fastExtractTar(archivePath: string): Promise<void> {
+  const workingDirectory = process.env["GITHUB_WORKSPACE"] ?? process.cwd();
+  const args = [
+    "-xf",
+    archivePath,
+    "-P",
+    "-C",
+    workingDirectory,
+    "--touch",
+    "--no-same-owner",
+    "--no-same-permissions",
+    "--use-compress-program",
+    "unzstd --long=30",
+  ];
+  core.info(`[fast-extract] tar ${args.join(" ")}`);
+  const start = Date.now();
+  await new Promise<void>((resolve, reject) => {
+    const proc = spawn("tar", args, { stdio: "inherit" });
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`tar exited with code ${code}`));
+    });
+  });
+  const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+  core.info(`[fast-extract] tar finished in ${elapsed}s`);
+}
 
 async function restoreCache() {
   try {
@@ -91,7 +133,7 @@ async function restoreCache() {
 
         core.info(`Cache Size: ${formatSize(obj.size)} (${obj.size} bytes)`);
 
-        await extractTar(archivePath, compressionMethod);
+        await fastExtractTar(archivePath);
         core.info("Cache restored from s3 successfully");
       }
     } catch (e) {

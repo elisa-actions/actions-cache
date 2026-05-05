@@ -86052,9 +86052,55 @@ const utils = __importStar(__nccwpck_require__(91518));
 const tar_1 = __nccwpck_require__(56490);
 const core = __importStar(__nccwpck_require__(42186));
 const path = __importStar(__nccwpck_require__(71017));
+const child_process_1 = __nccwpck_require__(32081);
 const state_1 = __nccwpck_require__(29738);
 const utils_1 = __nccwpck_require__(71314);
 process.on("uncaughtException", (e) => core.info("warning: " + e.message));
+// Fast extract: bypass upstream extractTar() which uses GNU tar without
+// flags that reduce per-file syscall overhead. The Go build cache contains
+// hundreds of thousands of small files, making metadata syscalls
+// (utimensat/chown/chmod) dominant on slow filesystems.
+//
+// Flags vs upstream:
+//   --touch                  skip per-file utimensat()
+//   --no-same-owner          skip per-file chown()
+//   --no-same-permissions    skip per-file chmod() (use umask)
+//
+// Safe for Go build cache: Go uses content-hash filenames, not mtime, for
+// cache lookup. golangci-lint cache likewise keys on content. Module cache
+// (~/go/pkg/mod) uses content-addressed paths.
+function fastExtractTar(archivePath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a;
+        const workingDirectory = (_a = process.env["GITHUB_WORKSPACE"]) !== null && _a !== void 0 ? _a : process.cwd();
+        const args = [
+            "-xf",
+            archivePath,
+            "-P",
+            "-C",
+            workingDirectory,
+            "--touch",
+            "--no-same-owner",
+            "--no-same-permissions",
+            "--use-compress-program",
+            "unzstd --long=30",
+        ];
+        core.info(`[fast-extract] tar ${args.join(" ")}`);
+        const start = Date.now();
+        yield new Promise((resolve, reject) => {
+            const proc = (0, child_process_1.spawn)("tar", args, { stdio: "inherit" });
+            proc.on("error", reject);
+            proc.on("close", (code) => {
+                if (code === 0)
+                    resolve();
+                else
+                    reject(new Error(`tar exited with code ${code}`));
+            });
+        });
+        const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+        core.info(`[fast-extract] tar finished in ${elapsed}s`);
+    });
+}
 function restoreCache() {
     return __awaiter(this, void 0, void 0, function* () {
         try {
@@ -86097,7 +86143,7 @@ function restoreCache() {
                         yield (0, tar_1.listTar)(archivePath, compressionMethod);
                     }
                     core.info(`Cache Size: ${(0, utils_1.formatSize)(obj.size)} (${obj.size} bytes)`);
-                    yield (0, tar_1.extractTar)(archivePath, compressionMethod);
+                    yield fastExtractTar(archivePath);
                     core.info("Cache restored from s3 successfully");
                 }
             }
